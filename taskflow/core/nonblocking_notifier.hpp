@@ -255,25 +255,53 @@ class NonblockingNotifierV1 {
   // notify wakes one or all waiting threads.
   // Must be called after changing the associated wait predicate.
   template <bool all>
-  void _notify() {
+  void _notify() {};
+
+  template <>
+  void _notify<true>() {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     uint64_t state = _state.load(std::memory_order_acquire);
+    
+    const uint64_t kStack = state & kStackMask;
+    
     for (;;) {
       // Easy case: no waiters.
-      if ((state & kStackMask) == kStackMask && (state & kWaiterMask) == 0) {
+      if (kStack == kStackMask && (state & kWaiterMask) == 0) {
+        return;
+      }
+      uint64_t waiters = (state & kWaiterMask) >> kWaiterShift;
+      // Reset prewait counter and empty wait list.
+      uint64_t newstate = (state & kEpochMask) + (kEpochInc * waiters) + kStackMask;
+      if (_state.compare_exchange_weak(state, newstate,
+                                       std::memory_order_acquire)) {
+        if (kStack == kStackMask) return;
+        Waiter* w = &_waiters[kStack];
+        _unpark(w);
+        return;
+      }
+    }
+  }
+
+  template <>
+  void _notify<false>() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    uint64_t state = _state.load(std::memory_order_acquire);
+    
+    const uint64_t kStack = state & kStackMask;
+    
+    for (;;) {
+      // Easy case: no waiters.
+      if (kStack == kStackMask && (state & kWaiterMask) == 0) {
         return;
       }
       uint64_t waiters = (state & kWaiterMask) >> kWaiterShift;
       uint64_t newstate;
-      if (all) {
-        // Reset prewait counter and empty wait list.
-        newstate = (state & kEpochMask) + (kEpochInc * waiters) + kStackMask;
-      } else if (waiters) {
+      if (waiters) {
         // There is a thread in pre-wait state, unblock it.
         newstate = state + kEpochInc - kWaiterInc;
       } else {
         // Pop a waiter from list and unpark it.
-        Waiter* w = &_waiters[state & kStackMask];
+        Waiter* w = &_waiters[kStack];
         Waiter* wnext = w->next.load(std::memory_order_relaxed);
         uint64_t next = kStackMask;
         //if (wnext != nullptr) next = wnext - &_waiters[0];
@@ -288,17 +316,16 @@ class NonblockingNotifierV1 {
       }
       if (_state.compare_exchange_weak(state, newstate,
                                        std::memory_order_acquire)) {
-        if (!all && waiters) return;  // unblocked pre-wait thread
-        if ((state & kStackMask) == kStackMask) return;
-        Waiter* w = &_waiters[state & kStackMask];
-        if (!all) {
-          w->next.store(nullptr, std::memory_order_relaxed);
-        }
+        if (waiters) return;  // unblocked pre-wait thread
+        if (kStack == kStackMask) return;
+        Waiter* w = &_waiters[kStack];
+        w->next.store(nullptr, std::memory_order_relaxed);
         _unpark(w);
         return;
       }
     }
   }
+
 };
 
 
@@ -495,7 +522,33 @@ class NonblockingNotifierV2 {
   // Notify wakes one or all waiting threads.
   // Must be called after changing the associated wait predicate.
   template <bool notifyAll>
-  void _notify() {
+  void _notify() {}
+
+  template <>
+  void _notify<true>() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    uint64_t state = _state.load(std::memory_order_acquire);
+    for (;;) {
+      //_check_state(state);
+      const uint64_t waiters = (state & kWaiterMask) >> kWaiterShift;
+      const uint64_t sigs = (state & kSignalMask) >> kSignalShift;
+      // Easy case: no waiters.
+      if ((state & kStackMask) == kStackMask && waiters == sigs) return;
+
+      // Empty wait stack and set signal to number of pre-wait threads.
+      uint64_t newstate = (state & kWaiterMask) | (waiters << kSignalShift) | kStackMask;
+
+      if (_state.compare_exchange_weak(state, newstate, std::memory_order_acq_rel)) {
+        if ((state & kStackMask) == kStackMask) return;
+        Waiter* w = &_waiters[state & kStackMask];
+        _unpark(w);
+        return;
+      }
+    }
+  }
+
+  template <>
+  void _notify<false>() {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     uint64_t state = _state.load(std::memory_order_acquire);
     for (;;) {
@@ -505,10 +558,7 @@ class NonblockingNotifierV2 {
       // Easy case: no waiters.
       if ((state & kStackMask) == kStackMask && waiters == sigs) return;
       uint64_t newstate;
-      if (notifyAll) {
-        // Empty wait stack and set signal to number of pre-wait threads.
-        newstate = (state & kWaiterMask) | (waiters << kSignalShift) | kStackMask;
-      } else if (sigs < waiters) {
+      if (sigs < waiters) {
         // There is a thread in pre-wait state, unblock it.
         newstate = state + kSignalInc;
       } else {
@@ -517,12 +567,11 @@ class NonblockingNotifierV2 {
         uint64_t next = w->next.load(std::memory_order_relaxed);
         newstate = (state & (kWaiterMask | kSignalMask)) | next;
       }
-      //_check_state(newstate);
       if (_state.compare_exchange_weak(state, newstate, std::memory_order_acq_rel)) {
-        if (!notifyAll && (sigs < waiters)) return;  // unblocked pre-wait thread
+        if (sigs < waiters) return;  // unblocked pre-wait thread
         if ((state & kStackMask) == kStackMask) return;
         Waiter* w = &_waiters[state & kStackMask];
-        if (!notifyAll) w->next.store(kStackMask, std::memory_order_relaxed);
+        w->next.store(kStackMask, std::memory_order_relaxed);
         _unpark(w);
         return;
       }
